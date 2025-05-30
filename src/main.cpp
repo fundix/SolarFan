@@ -1,11 +1,9 @@
-#ifndef ATOMS3
-#define ATOMS3
-#endif
-
 #include <Arduino.h>
 #include "esp_log.h"
+#include "Wire.h"
 #define TAG "MAIN"
 
+#include <M5AtomS3.h>
 #include "M5GFX.h"
 #include "M5Unified.h"
 
@@ -56,13 +54,6 @@ void longPressed();
 #define PWM_FREQUENCY 10000 // 10 kHz
 #define PWM_RESOLUTION 10   // 10bit (0-1023)
 
-#ifndef ATOMS3
-// WS2812 LED definitions
-#define LED_PIN 35
-#define NUM_LEDS 1
-CRGB leds[NUM_LEDS];
-#endif
-
 Preferences preferences;
 
 // Speed limits
@@ -71,13 +62,11 @@ Preferences preferences;
 // Global variables
 static bool doConnect = false;
 
-#ifdef ATOMS3
 static unsigned long buttonPressStartTime = 0;
 static bool buttonPressed = false;
 static bool longButtonPressed = false;
 static bool updateStarted = false;
 static float rotationAngle = 0.0f;
-#endif
 
 void drawGUI();
 
@@ -97,9 +86,6 @@ void setup()
   canvas.createSprite(M5.Display.width(), M5.Display.height());
   canvas.setTextColor(WHITE);
 
-  ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
-  ledcAttachPin(PWM_GPIO, PWM_CHANNEL);
-
   pinMode(BTN1, INPUT_PULLUP);
 
   static TimerHandle_t guiTimer = NULL;
@@ -116,13 +102,44 @@ void setup()
         });
     xTimerStart(guiTimer, 0);
   }
+
+  Wire.begin(2, 1);
 }
 
 void loop()
 {
   delay(10);
 
-  buttonLoop();
+  // buttonLoop();
+
+  int address;
+  int error;
+  AtomS3.Lcd.printf("\nscanning Address [HEX]\n");
+  for (address = 1; address < 127; address++)
+  {
+    Wire.beginTransmission(
+        address);                   // Data transmission to the specified device address
+                                    // starts.   开始向指定的设备地址进行传输数据
+    error = Wire.endTransmission(); /*Stop data transmission with the slave.
+              停止与从机的数据传输 0: success.  成功 1: The amount of data
+              exceeds the transmission buffer capacity limit.
+              数据量超过传送缓存容纳限制 return value:              2:
+              Received NACK when sending address.  传送地址时收到 NACK 3:
+              Received NACK when transmitting data.  传送数据时收到 NACK
+                                         4: Other errors.  其它错误 */
+    if (error == 0)
+    {
+      AtomS3.Lcd.print(address, HEX);
+      AtomS3.Lcd.print(" ");
+    }
+    else
+      AtomS3.Lcd.print(".");
+
+    delay(10);
+  }
+  delay(1000);
+  AtomS3.Lcd.setCursor(1, 12);
+  AtomS3.Lcd.fillRect(1, 15, 128, 128, BLACK);
 }
 
 void buttonLoop()
