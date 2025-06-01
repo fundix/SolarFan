@@ -25,6 +25,7 @@ const uint8_t bat_addr = 0x40;   // Adresa INA228 pro baterii
 const uint8_t solar_addr = 0x41; // Adresa INA228 pro solární panel
 Adafruit_INA228 ina228_bat = Adafruit_INA228();
 Adafruit_INA228 ina228_solar = Adafruit_INA228();
+bool ina_inicialized = false;
 
 float bat_shuntVoltage = 0.0;
 float bat_busVoltage = 0.0;
@@ -43,8 +44,11 @@ BLEScan *pBLEScan;
 bool connected = false;
 #undef CONFIG_BTC_TASK_STACK_SIZE
 #define CONFIG_BTC_TASK_STACK_SIZE 32768
-std::string addresses[10];
-int addressCount = 0;
+float BLE_temperature = 0.0f; // Teplota z BLE senzoru
+float BLE_humidity = 0.0f;    // Vlhkost z BLE senzoru
+float BLE_voltage = 0.0f;     // Napětí z BLE senzoru (pokud je potřeba)
+// std::string addresses[10];
+// int addressCount = 0;
 
 // The remote service we wish to connect to.
 static BLEUUID serviceUUID("ebe0ccb0-7a0a-4b0c-8a1a-6ff2997da3a6");
@@ -86,13 +90,13 @@ class MyClientCallback : public BLEClientCallbacks
   void onConnect(BLEClient *pclient)
   {
     connected = true;
-    Serial.printf(" * Connected %s\n", pclient->getPeerAddress().toString().c_str());
+    ESP_LOGI(TAG, " * Connected %s", pclient->getPeerAddress().toString().c_str());
   }
 
   void onDisconnect(BLEClient *pclient)
   {
     connected = false;
-    Serial.printf(" * Disconnected %s\n", pclient->getPeerAddress().toString().c_str());
+    ESP_LOGI(TAG, " * Disconnected %s", pclient->getPeerAddress().toString().c_str());
   }
 };
 
@@ -102,15 +106,14 @@ static void notifyCallback(
     size_t length,
     bool isNotify)
 {
-  float temp;
-  float humi;
-  float voltage;
-  Serial.print(" + Notify callback for characteristic ");
-  Serial.println(pBLERemoteCharacteristic->getUUID().toString().c_str());
-  temp = (pData[0] | (pData[1] << 8)) * 0.01; // little endian
-  humi = pData[2];
-  voltage = (pData[3] | (pData[4] << 8)) * 0.001; // little endian
-  Serial.printf("temp = %.1f C ; humidity = %.1f %% ; voltage = %.3f V\n", temp, humi, voltage);
+  // float temp;
+  // float humi;
+  // float voltage;
+  ESP_LOGI(TAG, " + Notify callback for characteristic %s", pBLERemoteCharacteristic->getUUID().toString().c_str());
+  BLE_temperature = (pData[0] | (pData[1] << 8)) * 0.01; // little endian
+  BLE_humidity = pData[2];
+  BLE_voltage = (pData[3] | (pData[4] << 8)) * 0.001; // little endian
+  ESP_LOGI(TAG, "temp = %.1f C ; humidity = %.1f %% ; voltage = %.3f V", BLE_temperature, BLE_humidity, BLE_voltage);
   pClient->disconnect();
 }
 
@@ -210,13 +213,20 @@ void setup()
   }
   Serial.println("I2C scan done");
 
-  ina228_bat.begin(bat_addr);     // Inicializace INA228 pro baterii
-  ina228_solar.begin(solar_addr); // Inicializace INA228 pro solární panel
+  if (ina228_bat.begin(bat_addr) && ina228_solar.begin(solar_addr))
+  {
+    ina_inicialized = true; // Pokud se podařilo inicializovat oba INA228, nastavíme příznak
+    ESP_LOGI(TAG, "INA228 devices initialized successfully");
 
-  ina228_bat.setShunt(0.015, 10.0);
-  ina228_bat.setAveragingCount(INA228_COUNT_64);
-  ina228_bat.setVoltageConversionTime(INA228_TIME_540_us);
-  ina228_bat.setCurrentConversionTime(INA228_TIME_280_us);
+    ina228_bat.setShunt(0.015, 10.0);
+    ina228_bat.setAveragingCount(INA228_COUNT_64);
+    ina228_bat.setVoltageConversionTime(INA228_TIME_540_us);
+    ina228_bat.setCurrentConversionTime(INA228_TIME_280_us);
+  }
+  else
+  {
+    ESP_LOGE(TAG, "Failed to initialize INA228 devices");
+  }
 
   BLEDevice::init("ESP32");
   createBleClientWithCallbacks();
@@ -262,6 +272,37 @@ void loop()
   // Volání buttonLoop() pro zpracování stisku tlačítka
   buttonLoop();
 
+  // BLE scanning and connection to sensors named "LYWSD03MMC"
+  BLEScanResults *foundDevices = pBLEScan->start(SCAN_TIME);
+  int deviceCount = foundDevices->getCount();
+  ESP_LOGI(TAG, "+ Found device count: %d", deviceCount);
+  for (int i = 0; i < deviceCount; i++)
+  {
+    BLEAdvertisedDevice advertised = foundDevices->getDevice(i);
+    if (advertised.haveName())
+    {
+      ESP_LOGI(TAG, "%s", advertised.toString().c_str());
+    }
+    if (advertised.haveName() && advertised.getName() == "LYWSD03MMC")
+    {
+      BLEAddress sensorAddress = advertised.getAddress();
+      ESP_LOGI(TAG, "+ Connecting to sensor: %s", sensorAddress.toString().c_str());
+      connectSensor(sensorAddress);
+      registerNotification();
+      // Wait up to 5 seconds for notification or disconnect
+      unsigned long startTime = millis();
+      while (connected && (millis() - startTime < 5000))
+      {
+        delay(10);
+      }
+      if (connected)
+      {
+        ESP_LOGI(TAG, "Connection timeout, disconnecting");
+        pClient->disconnect();
+      }
+    }
+  }
+
   static unsigned long lastDrawTime = 0;
   unsigned long currentTime = millis();
   if (currentTime - lastDrawTime >= 500)
@@ -270,54 +311,16 @@ void loop()
     drawGUI();
     lastDrawTime = currentTime;
   }
-
-  BLEScanResults foundDevices = pBLEScan->start(SCAN_TIME);
-  int count = foundDevices.getCount();
-  Serial.printf("+ Found device count : %d\n", count);
-  for (int i = 0; i < count; i++)
-  {
-    BLEAdvertisedDevice b = foundDevices.getDevice(i);
-    Serial.println(b.toString().c_str());
-    if (!b.getName().compare("LYWSDO3MMC"))
-    {
-      BLEAddress addr = b.getAddress();
-      addresses[addressCount] = addr.toString();
-      addressCount++;
-    }
-  }
-  for (int i = 0; i < addressCount; i++)
-  {
-    std::string curAddr = addresses[i];
-    bool found = false;
-    for (int j = 0; j < count; j++)
-    {
-      if (foundDevices.getDevice(j).getAddress().equals(BLEAddress(curAddr)))
-      {
-        found = true;
-      }
-    }
-    if (!found)
-    {
-      Serial.printf("* Remove offline address : %s\n", curAddr.c_str());
-      for (int j = addressCount; j > max(i, 1); j--)
-      {
-        addresses[j - 1] = addresses[j];
-      }
-      continue;
-    }
-    Serial.printf("+ Connect : %s\n", curAddr.c_str());
-    connectSensor(BLEAddress(curAddr));
-    registerNotification();
-    while (connected)
-    {
-      delay(10);
-    };
-  }
 }
 
 void measure()
 {
   // Battery measurements
+  if (!ina_inicialized)
+  {
+    ESP_LOGE(TAG, "INA228 devices not initialized");
+    return; // Pokud INA228 není inicializován, ukončíme měření
+  }
 
   bat_shuntVoltage = ina228_bat.readShuntVoltage();
   bat_busVoltage = ina228_bat.readBusVoltage() / 1000000.0;
