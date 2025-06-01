@@ -1,147 +1,347 @@
 #include <Arduino.h>
 #include "esp_log.h"
-#include "Wire.h"
+#include "Wire.h" // Pro I2C komunikaci
 #define TAG "MAIN"
 
-#include <M5AtomS3.h>
-#include "M5GFX.h"
-#include "M5Unified.h"
+#include <M5AtomS3.h>  // Specifická knihovna pro M5AtomS3
+#include "M5GFX.h"     // Grafická knihovna pro displej
+#include "M5Unified.h" // Sjednocená knihovna M5Stack
 
-M5Canvas canvas(&M5.Display);
+M5Canvas canvas(&M5.Display); // Vytvoření canvasu pro kreslení na displej
 
-#define BTN1 41
+#define BTN1 41 // Definice pinu pro tlačítko (GPIO 41)
 
-#include <Preferences.h>
+#include <Preferences.h> // Pro ukládání dat do NVS (Non-Volatile Storage)
 
-#include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <ESPAsyncHTTPUpdateServer.h>
+#include <WiFi.h>                     // Pro WiFi připojení
+#include <AsyncTCP.h>                 // Asynchronní TCP knihovna
+#include <ESPAsyncWebServer.h>        // Asynchronní webový server
+#include <ESPAsyncHTTPUpdateServer.h> // Pro OTA aktualizace firmwaru
 ESPAsyncHTTPUpdateServer updateServer;
-AsyncWebServer server(80);
+AsyncWebServer server(80); // Webový server na portu 80
 
+#include <Adafruit_INA228.h>
+const uint8_t bat_addr = 0x40;   // Adresa INA228 pro baterii
+const uint8_t solar_addr = 0x41; // Adresa INA228 pro solární panel
+Adafruit_INA228 ina228_bat = Adafruit_INA228();
+Adafruit_INA228 ina228_solar = Adafruit_INA228();
+
+float bat_shuntVoltage = 0.0;
+float bat_busVoltage = 0.0;
+float bat_current = 0.0;
+float bat_power = 0.0;
+
+float solar_shuntVoltage = 0.0;
+float solar_busVoltage = 0.0;
+float solar_current = 0.0;
+float solar_power = 0.0;
+
+#include <BLEDevice.h>
+BLEClient *pClient;
+BLEScan *pBLEScan;
+#define SCAN_TIME 10 // seconds
+bool connected = false;
+#undef CONFIG_BTC_TASK_STACK_SIZE
+#define CONFIG_BTC_TASK_STACK_SIZE 32768
+std::string addresses[10];
+int addressCount = 0;
+
+// The remote service we wish to connect to.
+static BLEUUID serviceUUID("ebe0ccb0-7a0a-4b0c-8a1a-6ff2997da3a6");
+// The characteristic of the remote service we are interested in.
+static BLEUUID charUUID("ebe0ccc1-7a0a-4b0c-8a1a-6ff2997da3a6");
+
+void measure();
+// Funkce pro obsluhu nenalezených stránek webového serveru
 void notFound(AsyncWebServerRequest *request)
 {
   request->send(404, "text/plain", "Not found");
 }
 
-// Target device name
-// #define TARGET_DEVICE_NAME "SIGMA SPEED 17197"
-#define TARGET_DEVICE_NAME "SIGMA SPEED"
-
-// UUID of CSC service and measurement characteristic
-#define CSC_SERVICE_UUID "1816"
-#define CSC_CHAR_UUID "2A5B"
-
-// Scan duration (0 = continuous)
-#define SCAN_TIME_MS 0
-
-const float WHEEL_CIRCUMFERENCE = 2.146; // [m]
-
-// Global variables for storing previous measurement (for speed calculation)
-uint32_t previousCumulativeRevs = 0;
-uint16_t previousLastEventTime = 0;
-bool firstMeasurement = true;
-
+// Deklarace funkcí
 void setupWiFiClient();
 void buttonLoop();
 void shortPressed();
 void longPressed();
 
-// PWM definitions
-#define PWM_GPIO 38
-#define PWM_CHANNEL 0
-#define PWM_FREQUENCY 10000 // 10 kHz
-#define PWM_RESOLUTION 10   // 10bit (0-1023)
+// PWM definice
+#define PWM_GPIO 38         // GPIO pro PWM výstup
+#define PWM_CHANNEL 0       // PWM kanál
+#define PWM_FREQUENCY 10000 // Frekvence PWM (10 kHz)
+#define PWM_RESOLUTION 10   // Rozlišení PWM (10bit, 0-1023)
 
-Preferences preferences;
+Preferences preferences; // Instance pro NVS Preferences
 
-// Speed limits
-#define MIN_SPEED 3.0f  // km/h, below this value PWM = 0%
-#define MAX_SPEED 35.0f // km/h, at this value PWM = 100%
-// Global variables
-static bool doConnect = false;
-
+// Globální proměnné
 static unsigned long buttonPressStartTime = 0;
 static bool buttonPressed = false;
 static bool longButtonPressed = false;
 static bool updateStarted = false;
-static float rotationAngle = 0.0f;
+static float rotationAngle = 0.0f; // Úhel rotace pro displej
 
-void drawGUI();
+void drawGUI(); // Deklarace funkce pro kreslení GUI
+
+class MyClientCallback : public BLEClientCallbacks
+{
+  void onConnect(BLEClient *pclient)
+  {
+    connected = true;
+    Serial.printf(" * Connected %s\n", pclient->getPeerAddress().toString().c_str());
+  }
+
+  void onDisconnect(BLEClient *pclient)
+  {
+    connected = false;
+    Serial.printf(" * Disconnected %s\n", pclient->getPeerAddress().toString().c_str());
+  }
+};
+
+static void notifyCallback(
+    BLERemoteCharacteristic *pBLERemoteCharacteristic,
+    uint8_t *pData,
+    size_t length,
+    bool isNotify)
+{
+  float temp;
+  float humi;
+  float voltage;
+  Serial.print(" + Notify callback for characteristic ");
+  Serial.println(pBLERemoteCharacteristic->getUUID().toString().c_str());
+  temp = (pData[0] | (pData[1] << 8)) * 0.01; // little endian
+  humi = pData[2];
+  voltage = (pData[3] | (pData[4] << 8)) * 0.001; // little endian
+  Serial.printf("temp = %.1f C ; humidity = %.1f %% ; voltage = %.3f V\n", temp, humi, voltage);
+  pClient->disconnect();
+}
+
+void registerNotification()
+{
+  if (!connected)
+  {
+    Serial.println(" - Premature disconnection");
+    return;
+  }
+  // Obtain a reference to the service we are after in the remote BLE server.
+  BLERemoteService *pRemoteService = pClient->getService(serviceUUID);
+  if (pRemoteService == nullptr)
+  {
+    Serial.print(" - Failed to find our service UUID: ");
+    Serial.println(serviceUUID.toString().c_str());
+    pClient->disconnect();
+  }
+  Serial.println(" + Found our service");
+
+  // Obtain a reference to the characteristic in the service of the remote BLE server.
+  BLERemoteCharacteristic *pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
+  if (pRemoteCharacteristic == nullptr)
+  {
+    Serial.print(" - Failed to find our characteristic UUID: ");
+    Serial.println(charUUID.toString().c_str());
+    pClient->disconnect();
+  }
+  Serial.println(" + Found our characteristic");
+  pRemoteCharacteristic->registerForNotify(notifyCallback);
+}
+
+void createBleClientWithCallbacks()
+{
+  pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new MyClientCallback());
+}
+
+void connectSensor(BLEAddress htSensorAddress)
+{
+  pClient->connect(htSensorAddress);
+}
 
 void setup()
 {
+  // Inicializace NVS pro ukládání nastavení displeje
   preferences.begin("display", false);
-  rotationAngle = preferences.getFloat("rotation", 0.0f);
+  rotationAngle = preferences.getFloat("rotation", 0.0f); // Načtení úhlu rotace
 
+  // Inicializace M5Stack AtomS3 a displeje
   M5.begin();
-  M5.Display.begin();
+  M5.Display.begin(); // Explicitní inicializace displeje pro jistotu
 
-  M5.Display.setBrightness(35);
+  M5.Display.setBrightness(35); // Nastavení jasu displeje
 
-  Serial.begin(115200);
-  vTaskDelay(2000 / portTICK_PERIOD_MS); // Delay for serial monitor connection
+  Serial.begin(115200);                  // Inicializace sériové komunikace
+  vTaskDelay(2000 / portTICK_PERIOD_MS); // Zpoždění pro připojení sériového monitoru
 
+  // Vytvoření canvasu o velikosti displeje
   canvas.createSprite(M5.Display.width(), M5.Display.height());
-  canvas.setTextColor(WHITE);
+  canvas.setTextColor(WHITE); // Nastavení barvy textu na bílou
 
-  pinMode(BTN1, INPUT_PULLUP);
+  pinMode(BTN1, INPUT_PULLUP); // Nastavení pinu tlačítka s interním pull-up rezistorem
 
-  static TimerHandle_t guiTimer = NULL;
-  if (guiTimer == NULL)
+  // Vytvoření FreeRTOS timeru pro pravidelné volání drawGUI()
+  // static TimerHandle_t guiTimer = NULL;
+  // if (guiTimer == NULL)
+  // {
+  //   guiTimer = xTimerCreate(
+  //       "GUITimer",
+  //       pdMS_TO_TICKS(250), // Volat každých 250 ms
+  //       pdTRUE,             // Auto reload (opakovaně)
+  //       nullptr,
+  //       [](TimerHandle_t xTimer) // Lambda funkce volaná timerem
+  //       {
+  //         drawGUI(); // Kreslení GUI
+  //       });
+  //   xTimerStart(guiTimer, 0); // Spuštění timeru
+  // }
+
+  // Inicializace I2C sběrnice (Wire) na pinech 2 a 1.
+  // POZNÁMKA: M5AtomS3 má obvykle interní I2C na GPIO 38/39 pro IMU.
+  // Wire.begin(2, 1) inicializuje Wire (I2C0) na těchto pinech.
+  // Pokud používáš externí I2C zařízení na jiných pinech, zkontroluj dokumentaci.
+  Wire.begin();
+
+  // I2C scan
+  Serial.println("I2C scan...");
+  for (int address = 1; address < 127; address++)
   {
-    guiTimer = xTimerCreate(
-        "GUITimer",
-        pdMS_TO_TICKS(250),
-        pdTRUE, // Auto reload
-        nullptr,
-        [](TimerHandle_t xTimer)
-        {
-          drawGUI();
-        });
-    xTimerStart(guiTimer, 0);
+    Wire.beginTransmission(address);
+    int error = Wire.endTransmission();
+    if (error == 0)
+    {
+      Serial.printf("I2C device found at 0x%02X\n", address);
+    }
   }
+  Serial.println("I2C scan done");
 
-  Wire.begin(2, 1);
+  ina228_bat.begin(bat_addr);     // Inicializace INA228 pro baterii
+  ina228_solar.begin(solar_addr); // Inicializace INA228 pro solární panel
+
+  ina228_bat.setShunt(0.015, 10.0);
+  ina228_bat.setAveragingCount(INA228_COUNT_64);
+  ina228_bat.setVoltageConversionTime(INA228_TIME_540_us);
+  ina228_bat.setCurrentConversionTime(INA228_TIME_280_us);
+
+  BLEDevice::init("ESP32");
+  createBleClientWithCallbacks();
+
+  pBLEScan = BLEDevice::getScan(); // create new scan
+  pBLEScan->setActiveScan(true);   // active scan uses more power, but get results faster
+  pBLEScan->setInterval(0x50);
+  pBLEScan->setWindow(0x30);
 }
 
 void loop()
 {
-  delay(10);
+  delay(10); // Krátké zpoždění pro stabilitu
 
-  // buttonLoop();
+  // Zde se objevoval konflikt s M5GFX knihovnou.
+  // I2C sken by neměl běžet neustále v loop() s aktivním GUI timerem.
+  // Prozatím je zakomentován. Pokud ho potřebuješ, zvaž spouštění na událost
+  // (např. stisk tlačítka) nebo v samostatném FreeRTOS tasku se synchronizací.
 
+  /*
   int address;
   int error;
-  AtomS3.Lcd.printf("\nscanning Address [HEX]\n");
+  M5.Display.printf("\nscanning Address [HEX]\n"); // Používáme M5.Display pro konzistenci
   for (address = 1; address < 127; address++)
   {
-    Wire.beginTransmission(
-        address);                   // Data transmission to the specified device address
-                                    // starts.   开始向指定的设备地址进行传输数据
-    error = Wire.endTransmission(); /*Stop data transmission with the slave.
-              停止与从机的数据传输 0: success.  成功 1: The amount of data
-              exceeds the transmission buffer capacity limit.
-              数据量超过传送缓存容纳限制 return value:              2:
-              Received NACK when sending address.  传送地址时收到 NACK 3:
-              Received NACK when transmitting data.  传送数据时收到 NACK
-                                         4: Other errors.  其它错误 */
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
     if (error == 0)
     {
-      AtomS3.Lcd.print(address, HEX);
-      AtomS3.Lcd.print(" ");
+      M5.Display.print(address, HEX);
+      M5.Display.print(" ");
     }
     else
-      AtomS3.Lcd.print(".");
+      M5.Display.print(".");
 
     delay(10);
   }
   delay(1000);
-  AtomS3.Lcd.setCursor(1, 12);
-  AtomS3.Lcd.fillRect(1, 15, 128, 128, BLACK);
+  M5.Display.setCursor(1, 12);
+  M5.Display.fillRect(1, 15, 128, 128, BLACK);
+  */
+
+  // Volání buttonLoop() pro zpracování stisku tlačítka
+  buttonLoop();
+
+  static unsigned long lastDrawTime = 0;
+  unsigned long currentTime = millis();
+  if (currentTime - lastDrawTime >= 500)
+  {
+    measure();
+    drawGUI();
+    lastDrawTime = currentTime;
+  }
+
+  BLEScanResults foundDevices = pBLEScan->start(SCAN_TIME);
+  int count = foundDevices.getCount();
+  Serial.printf("+ Found device count : %d\n", count);
+  for (int i = 0; i < count; i++)
+  {
+    BLEAdvertisedDevice b = foundDevices.getDevice(i);
+    Serial.println(b.toString().c_str());
+    if (!b.getName().compare("LYWSDO3MMC"))
+    {
+      BLEAddress addr = b.getAddress();
+      addresses[addressCount] = addr.toString();
+      addressCount++;
+    }
+  }
+  for (int i = 0; i < addressCount; i++)
+  {
+    std::string curAddr = addresses[i];
+    bool found = false;
+    for (int j = 0; j < count; j++)
+    {
+      if (foundDevices.getDevice(j).getAddress().equals(BLEAddress(curAddr)))
+      {
+        found = true;
+      }
+    }
+    if (!found)
+    {
+      Serial.printf("* Remove offline address : %s\n", curAddr.c_str());
+      for (int j = addressCount; j > max(i, 1); j--)
+      {
+        addresses[j - 1] = addresses[j];
+      }
+      continue;
+    }
+    Serial.printf("+ Connect : %s\n", curAddr.c_str());
+    connectSensor(BLEAddress(curAddr));
+    registerNotification();
+    while (connected)
+    {
+      delay(10);
+    };
+  }
 }
 
+void measure()
+{
+  // Battery measurements
+
+  bat_shuntVoltage = ina228_bat.readShuntVoltage();
+  bat_busVoltage = ina228_bat.readBusVoltage() / 1000000.0;
+  bat_current = ina228_bat.readCurrent();
+  bat_power = ina228_bat.readPower();
+
+  solar_shuntVoltage = ina228_solar.readShuntVoltage();
+  solar_busVoltage = ina228_solar.readBusVoltage() / 1000000.0;
+  solar_current = ina228_solar.readCurrent();
+  solar_power = ina228_solar.readPower();
+
+  // Table header
+  ESP_LOGI(TAG, "Battery & Solar Measurements Table");
+  ESP_LOGI(TAG, "+---------------+-------------+-------------+");
+  ESP_LOGI(TAG, "| Parameter     | Battery     | Solar       |");
+  ESP_LOGI(TAG, "+---------------+-------------+-------------+");
+  // ESP_LOGI(TAG, "| Shunt Voltage | %8.2f mV | %8.2f mV |", bat_shuntVoltage, solar_shuntVoltage);
+  ESP_LOGI(TAG, "| Bus Voltage   | %8.2f V  | %8.2f V  |", bat_busVoltage, solar_busVoltage);
+  // ESP_LOGI(TAG, "| Current       | %8.2f mA | %8.2f mA |", bat_current, solar_current);
+  ESP_LOGI(TAG, "| Power         | %8.2f mW | %8.2f mW |", bat_power, solar_power);
+  ESP_LOGI(TAG, "+---------------+-------------+-------------+");
+}
+
+// Funkce pro zpracování stisku tlačítka
 void buttonLoop()
 {
   if (digitalRead(BTN1) == LOW)
@@ -173,42 +373,44 @@ void buttonLoop()
   }
 }
 
+// Funkce pro krátký stisk tlačítka
 void shortPressed()
 {
   ESP_LOGI(TAG, "Short button press");
 
+  // Změna úhlu rotace displeje
   rotationAngle = fmod(rotationAngle + 15, 360.0f);
-
-  preferences.putFloat("rotation", rotationAngle);
+  preferences.putFloat("rotation", rotationAngle); // Uložení nového úhlu
 }
 
+// Funkce pro dlouhý stisk tlačítka
 void longPressed()
 {
   ESP_LOGI(TAG, "Long button press");
 
   if (updateStarted)
   {
-    ESP.restart();
+    ESP.restart(); // Restart zařízení, pokud je aktualizace spuštěna
     return;
   }
-  preferences.end();
+  preferences.end(); // Uzavření NVS Preferences
 
-  setupWiFiClient();
+  setupWiFiClient(); // Spuštění WiFi klienta a OTA serveru
 
-  updateStarted = true;
+  updateStarted = true; // Nastavení příznaku, že aktualizace začala
 }
 
+// Funkce pro kreslení grafického uživatelského rozhraní
 void drawGUI()
 {
-  canvas.fillSprite(BLACK);
-  // Draw speed gauge circle
+  canvas.fillSprite(BLACK); // Vyplnění canvasu černou barvou
+  // Vykreslení kruhu pro ukazatel rychlosti
   int centerX = canvas.width() / 2;
   int centerY = canvas.height() / 2;
-  int radius = min(centerX, centerY) - 5;
 
   if (updateStarted)
   {
-    canvas.fillArc(centerX, centerY, 59, 90, 0, 360, GREEN);
+    // Update mode display
     canvas.setTextSize(0.6);
     canvas.setTextDatum(middle_center);
     canvas.drawString("Updating", centerX, centerY - 11);
@@ -216,53 +418,50 @@ void drawGUI()
     if (WiFi.status() == WL_CONNECTED)
     {
       IPAddress IP = WiFi.localIP();
-
-      // Vypsání IP na displej (M5Canvas)
-#ifdef ATOMS3
       canvas.setTextSize(0.4);
-      canvas.setTextDatum(middle_center);
       canvas.drawString(IP.toString().c_str(), centerX, centerY + 11);
-#endif
     }
   }
   else
   {
-    // Draw background circle
-    // canvas.drawCircle(centerX, centerY, radius, WHITE);
+    // Nastavení pro canvas (jak bylo poskytnuto)
+    // --- Nastavení pro canvas ---
+    canvas.setFont(&fonts::Font4); // Nastavení písma (Font4 je dobrá volba pro čitelnost)
+    canvas.setTextSize(0.6);       // Nastavení velikosti textu pro všechny výpisy
+    // canvas.setTextDatum(middle_center); // Zarovnání textu na střed (horizontálně i vertikálně)
 
-    float comp_speed = 0;
+    int x = 10;           // Středová osa X displeje
+    int y = 10;           // Počáteční pozice Y pro střed prvního řádku textu
+    int lineSpacing = 17; // Mezera mezi středy řádků textu (upraveno pro velikost písma 0.6)
 
-    // Calculate angle based on current speed (0-270 degrees)
-    float angle = (comp_speed / MAX_SPEED) * 270.0f;
-    // angle = 270;
-    // Draw filled arc from -45 to current angle
-    canvas.fillArc(centerX, centerY, radius - 17, radius + 5,
-                   135,         // Start at -45 degrees (225 in fillArc coordinates)
-                   135 + angle, // End at calculated angle
-                   RED);
+    // --- Vykreslení informací na displej ---
+    // 2. Sekce Solárního panelu - zkrácené popisky
+    canvas.drawString("Solar", x, y); // Zkrácený název
+    y += lineSpacing;                 // Mezera před další sekcí
 
-    canvas.setFont(&fonts::Font7);
-    canvas.setTextSize(1);
-    canvas.setTextDatum(middle_center);
-    canvas.drawString(String(12, 0), centerX, centerY);
-    // canvas.drawString("45", centerX, centerY);
+    canvas.drawString(String(solar_busVoltage, 2) + "  V", x, y);
+    canvas.drawString(String(solar_power, 0) + "  mW", x + 60, y);
+    y += lineSpacing; // Mezera před další sekcí
 
-    canvas.setFont(&fonts::FreeSans18pt7b);
-    canvas.setTextSize(0.5);
-    canvas.drawString(String(12, 0), centerX, 107);
-    // canvas.drawString("100", centerX - 1, 107);
+    // 3. Sekce Baterie - zkrácené popisky
+    canvas.drawString("Bat", x, y); // Zkrácený název
+    y += lineSpacing;               // Mezera před další sekcí
+
+    canvas.drawString(String(bat_busVoltage, 2) + "  V", x, y);
+    canvas.drawString(String(bat_power, 0) + "  mW", x + 60, y);
   }
 
-  // canvas.pushSprite(0, 0);
+  // Otočení a zobrazení canvasu na displeji
   canvas.pushRotated(rotationAngle);
-  // canvas.pushSprite(0, 0);
 }
 
+// Funkce pro nastavení WiFi klienta a OTA serveru
 void setupWiFiClient()
 {
   // Připojení k WiFi síti
   WiFi.mode(WIFI_STA);
-  WiFi.begin("Vivien", "Bionicman123"); // Nahraď SSID a heslo správnými údaji
+  // Nahraď SSID a heslo správnými údaji!
+  WiFi.begin("Vivien", "Bionicman123");
 
   ESP_LOGI(TAG, "Connecting to WiFi...");
 
@@ -281,6 +480,7 @@ void setupWiFiClient()
     IPAddress IP = WiFi.localIP();
     ESP_LOGI(TAG, "Client IP address: %s", IP.toString().c_str());
 
+    // Nastavení webového serveru
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
               {
       String html = "<html><body>";
@@ -291,9 +491,9 @@ void setupWiFiClient()
 
     server.onNotFound(notFound);
 
-    // setup the updateServer with credentials
+    // Nastavení OTA aktualizačního serveru s přihlašovacími údaji
     updateServer.setup(&server, "admin", "admin");
-    server.begin();
+    server.begin(); // Spuštění webového serveru
   }
   else
   {
