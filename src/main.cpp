@@ -40,13 +40,16 @@ float solar_power = 0.0;
 #include <BLEDevice.h>
 BLEClient *pClient;
 BLEScan *pBLEScan;
-#define SCAN_TIME 10 // seconds
-bool connected = false;
+#define SCAN_TIME 0              // seconds
+volatile bool connected = false; // Updated to volatile for use across callbacks
 #undef CONFIG_BTC_TASK_STACK_SIZE
-#define CONFIG_BTC_TASK_STACK_SIZE 32768
+#define CONFIG_BTC_TASK_STACK_SIZE 37888
 float BLE_temperature = 0.0f; // Teplota z BLE senzoru
 float BLE_humidity = 0.0f;    // Vlhkost z BLE senzoru
 float BLE_voltage = 0.0f;     // Napětí z BLE senzoru (pokud je potřeba)
+void connectSensor(BLEAddress htSensorAddress);
+void registerNotification();
+
 // std::string addresses[10];
 // int addressCount = 0;
 
@@ -91,12 +94,34 @@ class MyClientCallback : public BLEClientCallbacks
   {
     connected = true;
     ESP_LOGI(TAG, " * Connected %s", pclient->getPeerAddress().toString().c_str());
+    registerNotification(); // Register BLE notifications now that the connection callback confirms link
   }
 
   void onDisconnect(BLEClient *pclient)
   {
     connected = false;
+    pBLEScan->start(SCAN_TIME, false); // Restart scan after disconnection
     ESP_LOGI(TAG, " * Disconnected %s", pclient->getPeerAddress().toString().c_str());
+  }
+};
+
+// Callback for handling discovered BLE devices in a non-blocking scan
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
+{
+  void onResult(BLEAdvertisedDevice advertisedDevice) override
+  {
+    if (advertisedDevice.haveName())
+    {
+      ESP_LOGI(TAG, "Advertised Device: %s", advertisedDevice.toString().c_str());
+    }
+    if (advertisedDevice.haveName() && advertisedDevice.getName() == "LYWSD03MMC")
+    {
+      BLEAddress sensorAddress = advertisedDevice.getAddress();
+      ESP_LOGI(TAG, "+ Connecting to sensor: %s", sensorAddress.toString().c_str());
+      connectSensor(sensorAddress);
+      // After connecting and registering for notifications,
+      // the notification callback will handle incoming data.
+    }
   }
 };
 
@@ -114,35 +139,35 @@ static void notifyCallback(
   BLE_humidity = pData[2];
   BLE_voltage = (pData[3] | (pData[4] << 8)) * 0.001; // little endian
   ESP_LOGI(TAG, "temp = %.1f C ; humidity = %.1f %% ; voltage = %.3f V", BLE_temperature, BLE_humidity, BLE_voltage);
-  pClient->disconnect();
+  // pClient->disconnect();
 }
 
 void registerNotification()
 {
   if (!connected)
   {
-    Serial.println(" - Premature disconnection");
+    ESP_LOGI(TAG, " - Premature disconnection");
     return;
   }
   // Obtain a reference to the service we are after in the remote BLE server.
   BLERemoteService *pRemoteService = pClient->getService(serviceUUID);
   if (pRemoteService == nullptr)
   {
-    Serial.print(" - Failed to find our service UUID: ");
-    Serial.println(serviceUUID.toString().c_str());
+    ESP_LOGI(TAG, " - Failed to find our service UUID: ");
+    ESP_LOGI(TAG, " - Failed to find our service UUID: %s", serviceUUID.toString().c_str());
     pClient->disconnect();
   }
-  Serial.println(" + Found our service");
+  ESP_LOGI(TAG, " + Found our service");
 
   // Obtain a reference to the characteristic in the service of the remote BLE server.
   BLERemoteCharacteristic *pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
   if (pRemoteCharacteristic == nullptr)
   {
-    Serial.print(" - Failed to find our characteristic UUID: ");
-    Serial.println(charUUID.toString().c_str());
+    ESP_LOGI(TAG, " - Failed to find our characteristic UUID: ");
+    ESP_LOGI(TAG, " - Failed to find our characteristic UUID: %s", charUUID.toString().c_str());
     pClient->disconnect();
   }
-  Serial.println(" + Found our characteristic");
+  ESP_LOGI(TAG, " + Found our characteristic");
   pRemoteCharacteristic->registerForNotify(notifyCallback);
 }
 
@@ -154,7 +179,37 @@ void createBleClientWithCallbacks()
 
 void connectSensor(BLEAddress htSensorAddress)
 {
-  pClient->connect(htSensorAddress);
+  ESP_LOGI(TAG, "Connecting (blocking) to %s", htSensorAddress.toString().c_str());
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->stop(); // Stop ongoing scan to free the controller before connecting
+  vTaskDelay(50 / portTICK_PERIOD_MS); // krátká pauza
+
+  // Always create a fresh BLEClient to avoid stale state
+  if (pClient != nullptr && pClient->isConnected())
+  {
+    pClient->disconnect();
+  }
+  pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new MyClientCallback());
+
+  // First try with RANDOM address because LYWSD03MMC uses a random static MAC
+  bool success = pClient->connect(htSensorAddress, BLE_ADDR_TYPE_RANDOM, true); // 'true' = wait until complete
+  if (!success)
+  {
+    ESP_LOGW(TAG, " - RANDOM address connect failed, retrying default");
+    success = pClient->connect(htSensorAddress, BLE_ADDR_TYPE_PUBLIC, true);
+  }
+
+  if (!success)
+  {
+    ESP_LOGE(TAG, " - Connection failed in blocking mode");
+    pBLEScan->start(SCAN_TIME, false); // Resume scanning
+    return;
+  }
+
+  ESP_LOGI(TAG, " + Connected (blocking), registering notifications");
+  connected = true;       // Make sure flag is set
+  registerNotification(); // Now set up notifications immediately
 }
 
 void setup()
@@ -201,17 +256,17 @@ void setup()
   Wire.begin();
 
   // I2C scan
-  Serial.println("I2C scan...");
-  for (int address = 1; address < 127; address++)
-  {
-    Wire.beginTransmission(address);
-    int error = Wire.endTransmission();
-    if (error == 0)
-    {
-      Serial.printf("I2C device found at 0x%02X\n", address);
-    }
-  }
-  Serial.println("I2C scan done");
+  // Serial.println("I2C scan...");
+  // for (int address = 1; address < 127; address++)
+  // {
+  //   Wire.beginTransmission(address);
+  //   int error = Wire.endTransmission();
+  //   if (error == 0)
+  //   {
+  //     Serial.printf("I2C device found at 0x%02X\n", address);
+  //   }
+  // }
+  // Serial.println("I2C scan done");
 
   if (ina228_bat.begin(bat_addr) && ina228_solar.begin(solar_addr))
   {
@@ -232,9 +287,12 @@ void setup()
   createBleClientWithCallbacks();
 
   pBLEScan = BLEDevice::getScan(); // create new scan
-  pBLEScan->setActiveScan(true);   // active scan uses more power, but get results faster
-  pBLEScan->setInterval(0x50);
-  pBLEScan->setWindow(0x30);
+  // Use non-blocking scan with a callback
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks(), false);
+  pBLEScan->setActiveScan(true); // active scan uses more power, but get results faster
+  // pBLEScan->setInterval(0x50);
+  // pBLEScan->setWindow(0x30);
+  pBLEScan->start(SCAN_TIME, false); // Start non-blocking scan indefinitely
 }
 
 void loop()
@@ -273,39 +331,11 @@ void loop()
   buttonLoop();
 
   // BLE scanning and connection to sensors named "LYWSD03MMC"
-  BLEScanResults *foundDevices = pBLEScan->start(SCAN_TIME);
-  int deviceCount = foundDevices->getCount();
-  ESP_LOGI(TAG, "+ Found device count: %d", deviceCount);
-  for (int i = 0; i < deviceCount; i++)
-  {
-    BLEAdvertisedDevice advertised = foundDevices->getDevice(i);
-    if (advertised.haveName())
-    {
-      ESP_LOGI(TAG, "%s", advertised.toString().c_str());
-    }
-    if (advertised.haveName() && advertised.getName() == "LYWSD03MMC")
-    {
-      BLEAddress sensorAddress = advertised.getAddress();
-      ESP_LOGI(TAG, "+ Connecting to sensor: %s", sensorAddress.toString().c_str());
-      connectSensor(sensorAddress);
-      registerNotification();
-      // Wait up to 5 seconds for notification or disconnect
-      unsigned long startTime = millis();
-      while (connected && (millis() - startTime < 5000))
-      {
-        delay(10);
-      }
-      if (connected)
-      {
-        ESP_LOGI(TAG, "Connection timeout, disconnecting");
-        pClient->disconnect();
-      }
-    }
-  }
+  // (Non-blocking scan and connection handled by MyAdvertisedDeviceCallbacks)
 
   static unsigned long lastDrawTime = 0;
   unsigned long currentTime = millis();
-  if (currentTime - lastDrawTime >= 500)
+  if (currentTime - lastDrawTime >= 1000)
   {
     measure();
     drawGUI();
@@ -318,7 +348,7 @@ void measure()
   // Battery measurements
   if (!ina_inicialized)
   {
-    ESP_LOGE(TAG, "INA228 devices not initialized");
+    // ESP_LOGE(TAG, "INA228 devices not initialized");
     return; // Pokud INA228 není inicializován, ukončíme měření
   }
 
