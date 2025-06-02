@@ -659,6 +659,15 @@ void drawGUI()
 
     canvas.drawString(String(bat_busVoltage, 2) + "  V", x, y);
     canvas.drawString(String(bat_power, 0) + "  mW", x + 60, y);
+
+    y += lineSpacing; // Mezera před další sekcí
+    // 4. Sekce BLE Senzor - zkrácené popisky
+    canvas.drawString("BLE", x, y); // Zkrácený název
+    y += lineSpacing;               // Mezera před další sekcí
+    canvas.drawString(String(BLE_temperature, 2) + "  °C", x, y);
+    canvas.drawString(String(BLE_humidity, 1) + "  %", x + 60, y);
+    y += lineSpacing; // Mezera před další sekcí
+    canvas.drawString(String(BLE_voltage, 3) + "  V", x, y);
   }
 
   // Otočení a zobrazení canvasu na displeji
