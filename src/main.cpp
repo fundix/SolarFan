@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "esp_log.h"
-#include "Wire.h" // Pro I2C komunikaci
+#include "Wire.h"        // Pro I2C komunikaci
+#include <driver/ledc.h> // ESP‑IDF LEDC driver (ledc_timer_config, ledc_channel_config, ledc_set_duty)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #define TAG "MAIN"
@@ -8,12 +9,13 @@
 #include <M5AtomS3.h>  // Specifická knihovna pro M5AtomS3
 #include "M5GFX.h"     // Grafická knihovna pro displej
 #include "M5Unified.h" // Sjednocená knihovna M5Stack
+#define TINY_GSM_DEBUG Serial
 #define TINY_GSM_MODEM_SIM800
 // Check if PSRAM is available and initialize canvas with PSRAM
 #include "credentials.h"
 #include <TinyGsmClient.h>
 #include <PubSubClient.h>
-#include <StreamDebugger.h>
+// #include <StreamDebugger.h>
 // StreamDebugger debugger(Serial2, Serial);
 
 M5Canvas canvas = M5Canvas(&M5.Display);
@@ -46,7 +48,6 @@ float solar_shuntVoltage = 0.0;
 float solar_busVoltage = 0.0;
 float solar_current = 0.0;
 float solar_power = 0.0;
-uint16_t pwm = 0;
 
 #include "NimBLEDevice.h"
 #include "NimBLEClient.h"
@@ -89,12 +90,16 @@ void buttonLoop();
 void shortPressed();
 void longPressed();
 void drawGUI(); // Deklarace funkce pro kreslení GUI
+void setupPWM();
 
 // PWM definice
-#define PWM_GPIO 38         // GPIO pro PWM výstup
-#define PWM_CHANNEL 0       // PWM kanál
-#define PWM_FREQUENCY 25000 // Frekvence PWM (10 kHz)
-#define PWM_RESOLUTION 10   // Rozlišení PWM (10bit, 0-1023)
+#define PWM_GPIO GPIO_NUM_6                 // GPIO pro PWM výstup
+#define PWM_CHANNEL 1                       // PWM kanál
+#define PWM_FREQUENCY 25000                 // Frekvence PWM (25 kHz)
+#define PWM_RESOLUTION 10                   // Rozlišení PWM (10 bit, 0‑1023)
+#define PWM_MAX ((1 << PWM_RESOLUTION) - 1) // Maximální hodnota duty‑cycle (1023 pro 10‑bit)
+#define PWM_MIN 100                         // Minimální hodnota duty‑cycle (0)
+uint16_t pwm = 0;
 
 Preferences preferences; // Instance pro NVS Preferences
 
@@ -377,14 +382,58 @@ void mqttCallback(char *topic, byte *payload, unsigned int len)
   if (String(topic) == topicControl)
   {
     // ledStatus = !ledStatus;
+    // Convert payload to string and then to integer
+    String msg = String((char *)payload, len);
+    pwm = msg.toInt();
+    // Ensure pwm value is within valid range (0‑PWM_MAX for 10‑bit resolution)
+    pwm = constrain(pwm, 0, PWM_MAX); // Udrž hodnotu v rozsahu rozlišení
+    // Set PWM value
+    if (pwm < PWM_MIN)
+    {
+      pwm = 0; // Ensure minimum duty cycle
+    }
+
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, static_cast<ledc_channel_t>(PWM_CHANNEL), pwm);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, static_cast<ledc_channel_t>(PWM_CHANNEL));
+    ESP_LOGI(TAG, "Setting PWM to %d", pwm);
     // digitalWrite(LED_PIN, ledStatus);
     // mqtt.publish(topicLedStatus, ledStatus ? "1" : "0");
   }
 }
 
+// Initialize PWM
+void setupPWM()
+{
+
+  // --- Configure LEDC timer ---
+  ledc_timer_config_t timer_conf = {
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .duty_resolution = (ledc_timer_bit_t)PWM_RESOLUTION,
+      .timer_num = LEDC_TIMER_0,
+      .freq_hz = PWM_FREQUENCY,
+      .clk_cfg = LEDC_AUTO_CLK};
+  ledc_timer_config(&timer_conf);
+
+  // --- Configure LEDC channel ---
+  ledc_channel_config_t channel_conf = {
+      .gpio_num = PWM_GPIO,
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .channel = static_cast<ledc_channel_t>(PWM_CHANNEL),
+      .timer_sel = LEDC_TIMER_0,
+      .duty = 0,
+      .hpoint = 0};
+  ledc_channel_config(&channel_conf);
+
+  // Ensure initial duty is applied
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, static_cast<ledc_channel_t>(PWM_CHANNEL), 0);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, static_cast<ledc_channel_t>(PWM_CHANNEL));
+
+  ledc_stop(LEDC_LOW_SPEED_MODE, (ledc_channel_t)PWM_CHANNEL, 0);
+}
+
 boolean mqttConnect()
 {
-  ESP_LOGI(TAG, "Connecting to %s", broker);
+  ESP_LOGI(TAG, "Connecting to MQTT broker %s:%d", broker, mqttPort);
 
   // Connect to MQTT Broker
   boolean status = mqtt.connect("SolarFan", MQTT_USER, MQTT_PASS);
@@ -392,9 +441,9 @@ boolean mqttConnect()
   // Or, if you want to authenticate MQTT:
   // boolean status = mqtt.connect("GsmClientName", "mqtt_user", "mqtt_pass");
 
-  if (status == false)
+  if (!status)
   {
-    ESP_LOGI(TAG, "fail");
+    ESP_LOGI(TAG, "fail (state = %d)", mqtt.state());
     return false;
   }
   ESP_LOGI(TAG, "success");
@@ -425,7 +474,7 @@ void publishMeasurements()
   payload += ",\"hum\":" + String(BLE_humidity, 1);
   payload += ",\"bv\":" + String(BLE_voltage, 3);
   payload += ",\"batv\":" + String(bat_busVoltage, 2);
-  payload += ",\"bp\":" + String(bat_power, 0);
+  payload += ",\"bp\":" + String(bat_current * bat_busVoltage, 0);
   payload += ",\"sv\":" + String(solar_busVoltage, 2);
   payload += ",\"sp\":" + String(solar_power, 0);
   payload += ",\"pwm\":" + String(pwm);
@@ -437,6 +486,7 @@ void publishMeasurements()
 
 void setup()
 {
+  setupPWM();
   // Inicializace NVS pro ukládání nastavení displeje
   preferences.begin("display", false);
   rotationAngle = preferences.getFloat("rotation", 0.0f); // Načtení úhlu rotace
@@ -456,44 +506,27 @@ void setup()
 
   pinMode(BTN1, INPUT_PULLUP); // Nastavení pinu tlačítka s interním pull-up rezistorem
 
-  // Vytvoření FreeRTOS timeru pro pravidelné volání drawGUI()
-  // static TimerHandle_t guiTimer = NULL;
-  // if (guiTimer == NULL)
-  // {
-  //   guiTimer = xTimerCreate(
-  //       "GUITimer",
-  //       pdMS_TO_TICKS(250), // Volat každých 250 ms
-  //       pdTRUE,             // Auto reload (opakovaně)
-  //       nullptr,
-  //       [](TimerHandle_t xTimer) // Lambda funkce volaná timerem
-  //       {
-  //         drawGUI(); // Kreslení GUI
-  //       });
-  //   xTimerStart(guiTimer, 0); // Spuštění timeru
-  // }
+  // Create FreeRTOS timer for publishing measurements every 5 minutes
+  static TimerHandle_t publishTimer = NULL;
+  if (publishTimer == NULL)
+  {
+    publishTimer = xTimerCreate(
+        "PublishTimer",
+        pdMS_TO_TICKS(300000), // 5 minutes = 300000 ms
+        pdTRUE,                // Auto reload
+        nullptr,
+        [](TimerHandle_t xTimer)
+        {
+          publishMeasurements();
+        });
+    xTimerStart(publishTimer, 0);
+  }
 
-  // Inicializace I2C sběrnice (Wire) na pinech 2 a 1.
-  // POZNÁMKA: M5AtomS3 má obvykle interní I2C na GPIO 38/39 pro IMU.
-  // Wire.begin(2, 1) inicializuje Wire (I2C0) na těchto pinech.
-  // Pokud používáš externí I2C zařízení na jiných pinech, zkontroluj dokumentaci.
   Wire.begin();
-
-  // I2C scan
-  // Serial.println("I2C scan...");
-  // for (int address = 1; address < 127; address++)
-  // {
-  //   Wire.beginTransmission(address);
-  //   int error = Wire.endTransmission();
-  //   if (error == 0)
-  //   {
-  //     Serial.printf("I2C device found at 0x%02X\n", address);
-  //   }
-  // }
-  // Serial.println("I2C scan done");
 
   if (ina228_bat.begin(bat_addr) && ina228_solar.begin(solar_addr))
   {
-    ina_inicialized = true; // Pokud se podařilo inicializovat oba INA228, nastavíme příznak
+    ina_inicialized = true;
     ESP_LOGI(TAG, "INA228 devices initialized successfully");
 
     ina228_bat.setShunt(0.015, 10.0);
@@ -508,6 +541,8 @@ void setup()
 
   ble_setup();
   xTaskCreatePinnedToCore(gsmTask, "GSM", 8192, NULL, 1, NULL, 1);
+
+  publishMeasurements(); // Initial publish
 }
 
 void ble_setup()
@@ -548,7 +583,7 @@ void ble_setup()
 
 void loop()
 {
-  delay(10); // Krátké zpoždění pro stabilitu
+  delay(20); // Krátké zpoždění pro stabilitu
 
   // Volání buttonLoop() pro zpracování stisku tlačítka
   buttonLoop();
@@ -583,7 +618,6 @@ void loop()
       NimBLEDevice::getScan()->start(scanTimeMs, true, true);
     }
   }
-
 }
 
 void measure()
@@ -606,15 +640,15 @@ void measure()
   solar_power = ina228_solar.readPower();
 
   // Table header
-  ESP_LOGI(TAG, "Battery & Solar Measurements Table");
-  ESP_LOGI(TAG, "+---------------+-------------+-------------+");
-  ESP_LOGI(TAG, "| Parameter     | Battery     | Solar       |");
-  ESP_LOGI(TAG, "+---------------+-------------+-------------+");
-  // ESP_LOGI(TAG, "| Shunt Voltage | %8.2f mV | %8.2f mV |", bat_shuntVoltage, solar_shuntVoltage);
-  ESP_LOGI(TAG, "| Bus Voltage   | %8.2f V  | %8.2f V  |", bat_busVoltage, solar_busVoltage);
-  // ESP_LOGI(TAG, "| Current       | %8.2f mA | %8.2f mA |", bat_current, solar_current);
-  ESP_LOGI(TAG, "| Power         | %8.2f mW | %8.2f mW |", bat_power, solar_power);
-  ESP_LOGI(TAG, "+---------------+-------------+-------------+");
+  ESP_LOGV(TAG, "Battery & Solar Measurements Table");
+  ESP_LOGV(TAG, "+---------------+-------------+-------------+");
+  ESP_LOGV(TAG, "| Parameter     | Battery     | Solar       |");
+  ESP_LOGV(TAG, "+---------------+-------------+-------------+");
+  // ESP_LOGV(TAG, "| Shunt Voltage | %8.2f mV | %8.2f mV |", bat_shuntVoltage, solar_shuntVoltage);
+  ESP_LOGV(TAG, "| Bus Voltage   | %8.2f V  | %8.2f V  |", bat_busVoltage, solar_busVoltage);
+  // ESP_LOGV(TAG, "| Current       | %8.2f mA | %8.2f mA |", bat_current, solar_current);
+  ESP_LOGV(TAG, "| Power         | %8.2f mW | %8.2f mW |", bat_power, solar_power);
+  ESP_LOGV(TAG, "+---------------+-------------+-------------+");
 }
 
 // Funkce pro zpracování stisku tlačítka
@@ -713,10 +747,18 @@ void drawGUI()
     // --- Vykreslení informací na displej ---
     // 2. Sekce Solárního panelu - zkrácené popisky
     canvas.drawString("Solar", x, y); // Zkrácený název
-    y += lineSpacing;                 // Mezera před další sekcí
+    if (mqtt.connected())
+    {
+      canvas.drawString("Mqtt 1", x + 60, y);
+    }
+    else
+    {
+      canvas.drawString("Mqtt 0", x + 60, y);
+    }
+    y += lineSpacing; // Mezera před další sekcí
 
     canvas.drawString(String(solar_busVoltage, 2) + "  V", x, y);
-    canvas.drawString(String(solar_power, 0) + "  mW", x + 60, y);
+    canvas.drawString(String(solar_power, 0) + "  mW", x + 50, y);
     y += lineSpacing; // Mezera před další sekcí
 
     // 3. Sekce Baterie - zkrácené popisky
@@ -724,7 +766,7 @@ void drawGUI()
     y += lineSpacing;               // Mezera před další sekcí
 
     canvas.drawString(String(bat_busVoltage, 2) + "  V", x, y);
-    canvas.drawString(String(bat_power, 0) + "  mW", x + 60, y);
+    canvas.drawString(String(bat_current * bat_busVoltage, 0) + "  mW", x + 50, y);
 
     y += lineSpacing; // Mezera před další sekcí
     // 4. Sekce BLE Senzor - zkrácené popisky
@@ -807,25 +849,39 @@ void gsmSetup()
   // SerialAT.begin(9600);
   vTaskDelay(6000 / portTICK_PERIOD_MS);
 
+  // Quick sanity check – does the modem answer "AT"?
+  ESP_LOGI(TAG, "Testing basic AT command...");
+  if (modem.testAT())
+  {
+    ESP_LOGI(TAG, "Modem replied OK to AT");
+  }
+  else
+  {
+    ESP_LOGE(TAG, "No response to AT command – check wiring or power");
+    return; // Abort further setup
+  }
+
   // Restart takes quite some time
   // To skip it, call init() instead of restart()
-  ESP_LOGI(TAG, "Initializing modem...");
-  modem.restart();
-  // modem.init();
+  ESP_LOGI(TAG, "Initializing modem (no full restart)...");
+  modem.init(); // soft‑init without reboot; faster if RST pin is not wired
 
   String modemInfo = modem.getModemInfo();
   ESP_LOGI(TAG, "Modem Info: %s", modemInfo.c_str());
 
   ESP_LOGI(TAG, "Waiting for network...");
   bool networkOk = false;
-  for (int attempt = 1; attempt <= 3 && !networkOk; ++attempt) {
+  for (int attempt = 1; attempt <= 3 && !networkOk; ++attempt)
+  {
     networkOk = modem.waitForNetwork(60000L);
-    if (!networkOk) {
+    if (!networkOk)
+    {
       ESP_LOGI(TAG, "Network not found (attempt %d/3)", attempt);
       delay(5000);
     }
   }
-  if (!networkOk) {
+  if (!networkOk)
+  {
     ESP_LOGE(TAG, "Unable to register to network");
     return;
   }
@@ -839,14 +895,17 @@ void gsmSetup()
   // GPRS connection parameters are usually set after network registration
   ESP_LOGI(TAG, "Connecting to %s", apn);
   bool gprsOk = false;
-  for (int attempt = 1; attempt <= 3 && !gprsOk; ++attempt) {
+  for (int attempt = 1; attempt <= 3 && !gprsOk; ++attempt)
+  {
     gprsOk = modem.gprsConnect(apn, gprsUser, gprsPass);
-    if (!gprsOk) {
+    if (!gprsOk)
+    {
       ESP_LOGI(TAG, "GPRS attach failed (attempt %d/3)", attempt);
       delay(5000);
     }
   }
-  if (!gprsOk) {
+  if (!gprsOk)
+  {
     ESP_LOGE(TAG, "Unable to attach to GPRS");
     return;
   }
@@ -881,7 +940,6 @@ void gsmLoop()
       ESP_LOGI(TAG, "Network re-connected");
     }
 
-#if TINY_GSM_USE_GPRS
     // and make sure GPRS/EPS is still connected
     if (!modem.isGprsConnected())
     {
@@ -898,7 +956,6 @@ void gsmLoop()
         ESP_LOGI(TAG, "GPRS reconnected");
       }
     }
-#endif
   }
 
   if (!mqtt.connected())
@@ -923,10 +980,10 @@ void gsmLoop()
 
 void gsmTask(void *pvParameters)
 {
-  gsmSetup();                                   // one‑time init
+  gsmSetup(); // one‑time init
   for (;;)
   {
-    gsmLoop();                                  // keep GSM & MQTT alive
-    vTaskDelay(10 / portTICK_PERIOD_MS);        // yield to other tasks
+    gsmLoop();                           // keep GSM & MQTT alive
+    vTaskDelay(10 / portTICK_PERIOD_MS); // yield to other tasks
   }
 }
