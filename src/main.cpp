@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include "esp_log.h"
 #include "Wire.h" // Pro I2C komunikaci
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #define TAG "MAIN"
 
 #include <M5AtomS3.h>  // Specifická knihovna pro M5AtomS3
@@ -12,7 +14,7 @@
 #include <TinyGsmClient.h>
 #include <PubSubClient.h>
 #include <StreamDebugger.h>
-StreamDebugger debugger(Serial2, Serial);
+// StreamDebugger debugger(Serial2, Serial);
 
 M5Canvas canvas = M5Canvas(&M5.Display);
 ;
@@ -67,22 +69,16 @@ void ble_setup();
 uint32_t lastReconnectAttempt = 0;
 void gsmLoop();
 void gsmSetup();
+void gsmTask(void *pvParameters);
 // Your GPRS credentials, if any
-const char apn[] = "hologram";
-const char gprsUser[] = "";
-const char gprsPass[] = "";
-const char *topicStatus = "GsmClient/status";
-const char *topicControl = "GsmClient/control";
-#define TINY_GSM_USE_GPRS true // Použití GPRS
+
+const char *topicStatus = "solarfan/status";
+const char *topicControl = "solarfan/control";
 
 #define GSM_AUTOBAUD_MIN 9600
 #define GSM_AUTOBAUD_MAX 115200
 
 // MQTT details
-const char *broker = "ff-data.pilsfree.net"; // MQTT broker
-const int mqttPort = 1888;                   // MQTT port
-const char *mqtt_user = "mqtt";              // MQTT username
-const char *mqtt_pass = "IoT6379726978";     // MQTT password
 
 void measure();
 // Funkce pro obsluhu nenalezených stránek webového serveru
@@ -97,7 +93,7 @@ void drawGUI(); // Deklarace funkce pro kreslení GUI
 // PWM definice
 #define PWM_GPIO 38         // GPIO pro PWM výstup
 #define PWM_CHANNEL 0       // PWM kanál
-#define PWM_FREQUENCY 10000 // Frekvence PWM (10 kHz)
+#define PWM_FREQUENCY 25000 // Frekvence PWM (10 kHz)
 #define PWM_RESOLUTION 10   // Rozlišení PWM (10bit, 0-1023)
 
 Preferences preferences; // Instance pro NVS Preferences
@@ -109,7 +105,7 @@ static bool longButtonPressed = false;
 static bool updateStarted = false;
 static float rotationAngle = 0.0f; // Úhel rotace pro displej
 // HardwareSerial Serial1(2);         // UART2
-TinyGsm modem(debugger);
+TinyGsm modem(Serial2);
 TinyGsmClient client(modem);
 PubSubClient mqtt(client);
 void publishMeasurements();
@@ -213,7 +209,7 @@ class ScanCallbacks : public NimBLEScanCallbacks
   }
 } scanCallbacks;
 
-bool connectToServer()
+bool connectToBTServer()
 {
   ESP_LOGI(TAG, "heap %d", ESP.getFreeHeap());
 
@@ -436,7 +432,7 @@ void publishMeasurements()
   payload += "}";
 
   // Publish to your chosen MQTT topic
-  mqtt.publish("GsmClient/data", payload.c_str());
+  mqtt.publish(topicStatus, payload.c_str());
 }
 
 void setup()
@@ -511,7 +507,7 @@ void setup()
   }
 
   ble_setup();
-  gsmSetup();
+  xTaskCreatePinnedToCore(gsmTask, "GSM", 8192, NULL, 1, NULL, 1);
 }
 
 void ble_setup()
@@ -573,7 +569,7 @@ void loop()
   {
     doConnect = false;
     /** Found a device we want to connect to, do it now */
-    if (connectToServer())
+    if (connectToBTServer())
     {
       BLEConnected = true;
 
@@ -588,7 +584,6 @@ void loop()
     }
   }
 
-  gsmLoop();
 }
 
 void measure()
@@ -810,7 +805,7 @@ void gsmSetup()
   // Set GSM module baud rate
   TinyGsmAutoBaud(Serial2, GSM_AUTOBAUD_MIN, GSM_AUTOBAUD_MAX);
   // SerialAT.begin(9600);
-  delay(6000);
+  vTaskDelay(6000 / portTICK_PERIOD_MS);
 
   // Restart takes quite some time
   // To skip it, call init() instead of restart()
@@ -822,10 +817,16 @@ void gsmSetup()
   ESP_LOGI(TAG, "Modem Info: %s", modemInfo.c_str());
 
   ESP_LOGI(TAG, "Waiting for network...");
-  if (!modem.waitForNetwork())
-  {
-    ESP_LOGI(TAG, "fail");
-    delay(10000);
+  bool networkOk = false;
+  for (int attempt = 1; attempt <= 3 && !networkOk; ++attempt) {
+    networkOk = modem.waitForNetwork(60000L);
+    if (!networkOk) {
+      ESP_LOGI(TAG, "Network not found (attempt %d/3)", attempt);
+      delay(5000);
+    }
+  }
+  if (!networkOk) {
+    ESP_LOGE(TAG, "Unable to register to network");
     return;
   }
   ESP_LOGI(TAG, "success");
@@ -835,13 +836,18 @@ void gsmSetup()
     ESP_LOGI(TAG, "Network connected");
   }
 
-#if TINY_GSM_USE_GPRS
   // GPRS connection parameters are usually set after network registration
   ESP_LOGI(TAG, "Connecting to %s", apn);
-  if (!modem.gprsConnect(apn, gprsUser, gprsPass))
-  {
-    ESP_LOGI(TAG, "fail");
-    delay(10000);
+  bool gprsOk = false;
+  for (int attempt = 1; attempt <= 3 && !gprsOk; ++attempt) {
+    gprsOk = modem.gprsConnect(apn, gprsUser, gprsPass);
+    if (!gprsOk) {
+      ESP_LOGI(TAG, "GPRS attach failed (attempt %d/3)", attempt);
+      delay(5000);
+    }
+  }
+  if (!gprsOk) {
+    ESP_LOGE(TAG, "Unable to attach to GPRS");
     return;
   }
   ESP_LOGI(TAG, "success");
@@ -850,11 +856,12 @@ void gsmSetup()
   {
     ESP_LOGI(TAG, "GPRS connected");
   }
-#endif
 
   // MQTT Broker setup
   mqtt.setServer(broker, mqttPort);
   mqtt.setCallback(mqttCallback);
+
+  mqttConnect();
 }
 
 void gsmLoop()
@@ -862,34 +869,33 @@ void gsmLoop()
   // Make sure we're still registered on the network
   if (!modem.isNetworkConnected())
   {
-    Serial.println("Network disconnected");
+    ESP_LOGI(TAG, "Network disconnected");
     if (!modem.waitForNetwork(180000L, true))
     {
-      Serial.println(" fail");
+      ESP_LOGI(TAG, " fail");
       delay(10000);
       return;
     }
     if (modem.isNetworkConnected())
     {
-      Serial.println("Network re-connected");
+      ESP_LOGI(TAG, "Network re-connected");
     }
 
 #if TINY_GSM_USE_GPRS
     // and make sure GPRS/EPS is still connected
     if (!modem.isGprsConnected())
     {
-      Serial.println("GPRS disconnected!");
-      Serial.print(F("Connecting to "));
-      Serial.print(apn);
+      ESP_LOGI(TAG, "GPRS disconnected!");
+      ESP_LOGI(TAG, "Connecting to %s", apn);
       if (!modem.gprsConnect(apn, gprsUser, gprsPass))
       {
-        Serial.println(" fail");
+        ESP_LOGI(TAG, " fail");
         delay(10000);
         return;
       }
       if (modem.isGprsConnected())
       {
-        Serial.println("GPRS reconnected");
+        ESP_LOGI(TAG, "GPRS reconnected");
       }
     }
 #endif
@@ -913,4 +919,14 @@ void gsmLoop()
   }
 
   mqtt.loop();
+}
+
+void gsmTask(void *pvParameters)
+{
+  gsmSetup();                                   // one‑time init
+  for (;;)
+  {
+    gsmLoop();                                  // keep GSM & MQTT alive
+    vTaskDelay(10 / portTICK_PERIOD_MS);        // yield to other tasks
+  }
 }
