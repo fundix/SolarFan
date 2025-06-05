@@ -6,8 +6,14 @@
 #include <M5AtomS3.h>  // Specifická knihovna pro M5AtomS3
 #include "M5GFX.h"     // Grafická knihovna pro displej
 #include "M5Unified.h" // Sjednocená knihovna M5Stack
-
+#define TINY_GSM_MODEM_SIM800
 // Check if PSRAM is available and initialize canvas with PSRAM
+#include "credentials.h"
+#include <TinyGsmClient.h>
+#include <PubSubClient.h>
+#include <StreamDebugger.h>
+StreamDebugger debugger(Serial2, Serial);
+
 M5Canvas canvas = M5Canvas(&M5.Display);
 ;
 
@@ -38,6 +44,7 @@ float solar_shuntVoltage = 0.0;
 float solar_busVoltage = 0.0;
 float solar_current = 0.0;
 float solar_power = 0.0;
+uint16_t pwm = 0;
 
 #include "NimBLEDevice.h"
 #include "NimBLEClient.h"
@@ -56,6 +63,56 @@ static const NimBLEAdvertisedDevice *advDevice;
 // The characteristic of the remote service we are interested in.
 #define CHAR_UUID "ebe0ccc1-7a0a-4b0c-8a1a-6ff2997da3a6"
 void ble_setup();
+
+uint32_t lastReconnectAttempt = 0;
+void gsmLoop();
+void gsmSetup();
+// Your GPRS credentials, if any
+const char apn[] = "hologram";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+const char *topicStatus = "GsmClient/status";
+const char *topicControl = "GsmClient/control";
+#define TINY_GSM_USE_GPRS true // Použití GPRS
+
+#define GSM_AUTOBAUD_MIN 9600
+#define GSM_AUTOBAUD_MAX 115200
+
+// MQTT details
+const char *broker = "ff-data.pilsfree.net"; // MQTT broker
+const int mqttPort = 1888;                   // MQTT port
+const char *mqtt_user = "mqtt";              // MQTT username
+const char *mqtt_pass = "IoT6379726978";     // MQTT password
+
+void measure();
+// Funkce pro obsluhu nenalezených stránek webového serveru
+
+// Deklarace funkcí
+void setupWiFiClient();
+void buttonLoop();
+void shortPressed();
+void longPressed();
+void drawGUI(); // Deklarace funkce pro kreslení GUI
+
+// PWM definice
+#define PWM_GPIO 38         // GPIO pro PWM výstup
+#define PWM_CHANNEL 0       // PWM kanál
+#define PWM_FREQUENCY 10000 // Frekvence PWM (10 kHz)
+#define PWM_RESOLUTION 10   // Rozlišení PWM (10bit, 0-1023)
+
+Preferences preferences; // Instance pro NVS Preferences
+
+// Globální proměnné
+static unsigned long buttonPressStartTime = 0;
+static bool buttonPressed = false;
+static bool longButtonPressed = false;
+static bool updateStarted = false;
+static float rotationAngle = 0.0f; // Úhel rotace pro displej
+// HardwareSerial Serial1(2);         // UART2
+TinyGsm modem(debugger);
+TinyGsmClient client(modem);
+PubSubClient mqtt(client);
+void publishMeasurements();
 
 /** Define a class to handle the callbacks for client connection events */
 class ClientCallbacks : public NimBLEClientCallbacks
@@ -293,8 +350,7 @@ bool connectToServer()
                      BLE_temperature, BLE_humidity, BLE_voltage);
           } else {
             ESP_LOGI(TAG, "Notification data size unexpected: %d bytes", length);
-          }
-        });
+          } });
 
         ESP_LOGI(TAG, "Subscribed to notifications!");
       }
@@ -317,31 +373,71 @@ bool connectToServer()
   return true;
 }
 
-void measure();
-// Funkce pro obsluhu nenalezených stránek webového serveru
+void mqttCallback(char *topic, byte *payload, unsigned int len)
+{
+  ESP_LOGI(TAG, "Message arrived [%s]: %.*s", topic, len, payload);
 
-// Deklarace funkcí
-void setupWiFiClient();
-void buttonLoop();
-void shortPressed();
-void longPressed();
+  // Only proceed if incoming message's topic matches
+  if (String(topic) == topicControl)
+  {
+    // ledStatus = !ledStatus;
+    // digitalWrite(LED_PIN, ledStatus);
+    // mqtt.publish(topicLedStatus, ledStatus ? "1" : "0");
+  }
+}
 
-// PWM definice
-#define PWM_GPIO 38         // GPIO pro PWM výstup
-#define PWM_CHANNEL 0       // PWM kanál
-#define PWM_FREQUENCY 10000 // Frekvence PWM (10 kHz)
-#define PWM_RESOLUTION 10   // Rozlišení PWM (10bit, 0-1023)
+boolean mqttConnect()
+{
+  ESP_LOGI(TAG, "Connecting to %s", broker);
 
-Preferences preferences; // Instance pro NVS Preferences
+  // Connect to MQTT Broker
+  boolean status = mqtt.connect("SolarFan", MQTT_USER, MQTT_PASS);
 
-// Globální proměnné
-static unsigned long buttonPressStartTime = 0;
-static bool buttonPressed = false;
-static bool longButtonPressed = false;
-static bool updateStarted = false;
-static float rotationAngle = 0.0f; // Úhel rotace pro displej
+  // Or, if you want to authenticate MQTT:
+  // boolean status = mqtt.connect("GsmClientName", "mqtt_user", "mqtt_pass");
 
-void drawGUI(); // Deklarace funkce pro kreslení GUI
+  if (status == false)
+  {
+    ESP_LOGI(TAG, "fail");
+    return false;
+  }
+  ESP_LOGI(TAG, "success");
+  // mqtt.publish(topicInit, "GsmClientTest started");
+  mqtt.subscribe(topicControl);
+  return mqtt.connected();
+}
+
+void publishMeasurements()
+{
+  // Make sure MQTT is connected before trying to publish
+  if (!mqtt.connected())
+  {
+    return;
+  }
+
+  // Build a JSON string with all fields
+  //   tmp  = BLE_temperature (°C)
+  //   hum  = BLE_humidity (%)
+  //   bv   = BLE_voltage (V)
+  //   batv = bat_busVoltage (V)
+  //   bp   = bat_power (mW)
+  //   sv   = solar_busVoltage (V)
+  //   sp   = solar_power (mW)
+  //   pwm  = pwm (0–1023)
+  String payload = "{";
+  payload += "\"tmp\":" + String(BLE_temperature, 2);
+  payload += ",\"hum\":" + String(BLE_humidity, 1);
+  payload += ",\"bv\":" + String(BLE_voltage, 3);
+  payload += ",\"batv\":" + String(bat_busVoltage, 2);
+  payload += ",\"bp\":" + String(bat_power, 0);
+  payload += ",\"sv\":" + String(solar_busVoltage, 2);
+  payload += ",\"sp\":" + String(solar_power, 0);
+  payload += ",\"pwm\":" + String(pwm);
+  payload += "}";
+
+  // Publish to your chosen MQTT topic
+  mqtt.publish("GsmClient/data", payload.c_str());
+}
 
 void setup()
 {
@@ -415,6 +511,7 @@ void setup()
   }
 
   ble_setup();
+  gsmSetup();
 }
 
 void ble_setup()
@@ -457,34 +554,6 @@ void loop()
 {
   delay(10); // Krátké zpoždění pro stabilitu
 
-  // Zde se objevoval konflikt s M5GFX knihovnou.
-  // I2C sken by neměl běžet neustále v loop() s aktivním GUI timerem.
-  // Prozatím je zakomentován. Pokud ho potřebuješ, zvaž spouštění na událost
-  // (např. stisk tlačítka) nebo v samostatném FreeRTOS tasku se synchronizací.
-
-  /*
-  int address;
-  int error;
-  M5.Display.printf("\nscanning Address [HEX]\n"); // Používáme M5.Display pro konzistenci
-  for (address = 1; address < 127; address++)
-  {
-    Wire.beginTransmission(address);
-    error = Wire.endTransmission();
-    if (error == 0)
-    {
-      M5.Display.print(address, HEX);
-      M5.Display.print(" ");
-    }
-    else
-      M5.Display.print(".");
-
-    delay(10);
-  }
-  delay(1000);
-  M5.Display.setCursor(1, 12);
-  M5.Display.fillRect(1, 15, 128, 128, BLACK);
-  */
-
   // Volání buttonLoop() pro zpracování stisku tlačítka
   buttonLoop();
 
@@ -518,6 +587,8 @@ void loop()
       NimBLEDevice::getScan()->start(scanTimeMs, true, true);
     }
   }
+
+  gsmLoop();
 }
 
 void measure()
@@ -723,4 +794,123 @@ void setupWiFiClient()
   // {
   //   ESP_LOGI(TAG, "Failed to connect to WiFi!");
   // }
+}
+
+void gsmSetup()
+{
+  ESP_LOGI(TAG, "Starting GSM modem Serial...");
+  // Serial1.begin(9600, SERIAL_8N1, 39, 38); // Inicializace sériového portu pro modem
+  Serial2.end();
+  Serial2.setPins(39, 38, -1); // Nastavení pinů pro RX, TX, RST (pokud není potřeba, použijte -1)
+  delay(100);
+
+  // !!!!!!!!!!!
+  // Set your reset, enable, power pins here
+  // !!!!!!!!!!!
+  // Set GSM module baud rate
+  TinyGsmAutoBaud(Serial2, GSM_AUTOBAUD_MIN, GSM_AUTOBAUD_MAX);
+  // SerialAT.begin(9600);
+  delay(6000);
+
+  // Restart takes quite some time
+  // To skip it, call init() instead of restart()
+  ESP_LOGI(TAG, "Initializing modem...");
+  modem.restart();
+  // modem.init();
+
+  String modemInfo = modem.getModemInfo();
+  ESP_LOGI(TAG, "Modem Info: %s", modemInfo.c_str());
+
+  ESP_LOGI(TAG, "Waiting for network...");
+  if (!modem.waitForNetwork())
+  {
+    ESP_LOGI(TAG, "fail");
+    delay(10000);
+    return;
+  }
+  ESP_LOGI(TAG, "success");
+
+  if (modem.isNetworkConnected())
+  {
+    ESP_LOGI(TAG, "Network connected");
+  }
+
+#if TINY_GSM_USE_GPRS
+  // GPRS connection parameters are usually set after network registration
+  ESP_LOGI(TAG, "Connecting to %s", apn);
+  if (!modem.gprsConnect(apn, gprsUser, gprsPass))
+  {
+    ESP_LOGI(TAG, "fail");
+    delay(10000);
+    return;
+  }
+  ESP_LOGI(TAG, "success");
+
+  if (modem.isGprsConnected())
+  {
+    ESP_LOGI(TAG, "GPRS connected");
+  }
+#endif
+
+  // MQTT Broker setup
+  mqtt.setServer(broker, mqttPort);
+  mqtt.setCallback(mqttCallback);
+}
+
+void gsmLoop()
+{
+  // Make sure we're still registered on the network
+  if (!modem.isNetworkConnected())
+  {
+    Serial.println("Network disconnected");
+    if (!modem.waitForNetwork(180000L, true))
+    {
+      Serial.println(" fail");
+      delay(10000);
+      return;
+    }
+    if (modem.isNetworkConnected())
+    {
+      Serial.println("Network re-connected");
+    }
+
+#if TINY_GSM_USE_GPRS
+    // and make sure GPRS/EPS is still connected
+    if (!modem.isGprsConnected())
+    {
+      Serial.println("GPRS disconnected!");
+      Serial.print(F("Connecting to "));
+      Serial.print(apn);
+      if (!modem.gprsConnect(apn, gprsUser, gprsPass))
+      {
+        Serial.println(" fail");
+        delay(10000);
+        return;
+      }
+      if (modem.isGprsConnected())
+      {
+        Serial.println("GPRS reconnected");
+      }
+    }
+#endif
+  }
+
+  if (!mqtt.connected())
+  {
+    ESP_LOGI(TAG, "=== MQTT NOT CONNECTED ===");
+    // Reconnect every 10 seconds
+    uint32_t t = millis();
+    if (t - lastReconnectAttempt > 10000L)
+    {
+      lastReconnectAttempt = t;
+      if (mqttConnect())
+      {
+        lastReconnectAttempt = 0;
+      }
+    }
+    delay(100);
+    return;
+  }
+
+  mqtt.loop();
 }
