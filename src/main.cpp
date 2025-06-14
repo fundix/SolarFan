@@ -71,6 +71,7 @@ uint32_t lastReconnectAttempt = 0;
 void gsmLoop();
 void gsmSetup();
 void gsmTask(void *pvParameters);
+bool mqttConnected = false;
 // Your GPRS credentials, if any
 
 const char *topicStatus = "solarfan/status";
@@ -533,6 +534,11 @@ void setup()
     ina228_bat.setAveragingCount(INA228_COUNT_64);
     ina228_bat.setVoltageConversionTime(INA228_TIME_540_us);
     ina228_bat.setCurrentConversionTime(INA228_TIME_280_us);
+
+    ina228_solar.setShunt(0.015, 10.0);
+    ina228_solar.setAveragingCount(INA228_COUNT_64);
+    ina228_solar.setVoltageConversionTime(INA228_TIME_540_us);
+    ina228_solar.setCurrentConversionTime(INA228_TIME_280_us);
   }
   else
   {
@@ -647,7 +653,7 @@ void measure()
   // ESP_LOGV(TAG, "| Shunt Voltage | %8.2f mV | %8.2f mV |", bat_shuntVoltage, solar_shuntVoltage);
   ESP_LOGV(TAG, "| Bus Voltage   | %8.2f V  | %8.2f V  |", bat_busVoltage, solar_busVoltage);
   // ESP_LOGV(TAG, "| Current       | %8.2f mA | %8.2f mA |", bat_current, solar_current);
-  ESP_LOGV(TAG, "| Power         | %8.2f mW | %8.2f mW |", bat_power, solar_power);
+  ESP_LOGV(TAG, "| Power         | %8.1f mW | %8.1f mW |", bat_power, solar_power);
   ESP_LOGV(TAG, "+---------------+-------------+-------------+");
 }
 
@@ -747,7 +753,7 @@ void drawGUI()
     // --- Vykreslení informací na displej ---
     // 2. Sekce Solárního panelu - zkrácené popisky
     canvas.drawString("Solar", x, y); // Zkrácený název
-    if (mqtt.connected())
+    if (mqttConnected)
     {
       canvas.drawString("Mqtt 1", x + 60, y);
     }
@@ -963,6 +969,8 @@ void gsmLoop()
     ESP_LOGI(TAG, "=== MQTT NOT CONNECTED ===");
     // Reconnect every 10 seconds
     uint32_t t = millis();
+    mqttConnected = false;
+
     if (t - lastReconnectAttempt > 10000L)
     {
       lastReconnectAttempt = t;
@@ -973,6 +981,10 @@ void gsmLoop()
     }
     delay(100);
     return;
+  }
+  else
+  {
+    mqttConnected = true;
   }
 
   mqtt.loop();
