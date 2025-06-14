@@ -844,7 +844,7 @@ void gsmSetup()
   ESP_LOGI(TAG, "Starting GSM modem Serial...");
   // Serial1.begin(9600, SERIAL_8N1, 39, 38); // Inicializace sériového portu pro modem
   Serial2.end();
-  Serial2.setPins(39, 38, -1); // Nastavení pinů pro RX, TX, RST (pokud není potřeba, použijte -1)
+  Serial2.setPins(38, 39, -1); // Nastavení pinů pro RX, TX, RST (pokud není potřeba, použijte -1)
   delay(100);
 
   // !!!!!!!!!!!
