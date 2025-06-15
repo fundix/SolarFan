@@ -10,7 +10,8 @@
 #include "M5GFX.h"     // Grafická knihovna pro displej
 #include "M5Unified.h" // Sjednocená knihovna M5Stack
 #define TINY_GSM_DEBUG Serial
-#define TINY_GSM_MODEM_SIM800
+#define TINY_GSM_MODEM_SIM7028
+
 // Check if PSRAM is available and initialize canvas with PSRAM
 #include "credentials.h"
 #include <TinyGsmClient.h>
@@ -23,7 +24,10 @@ M5Canvas canvas = M5Canvas(&M5.Display);
 
 #define BTN1 41 // Definice pinu pro tlačítko (GPIO 41)
 
-#include <Preferences.h> // Pro ukládání dat do NVS (Non-Volatile Storage)
+#include <Preferences.h>   // Pro ukládání dat do NVS (Non-Volatile Storage)
+#include <WiFi.h>          // Kvůli WiFi.mode()
+#include "esp_wifi.h"      // pro esp_wifi_stop() a esp_wifi_deinit()
+#include "esp32-hal-cpu.h" // pro setCpuFrequencyMhz()
 
 // #include <WiFi.h>                     // Pro WiFi připojení
 // #include <AsyncTCP.h>                 // Asynchronní TCP knihovna
@@ -67,6 +71,14 @@ static const NimBLEAdvertisedDevice *advDevice;
 #define CHAR_UUID "ebe0ccc1-7a0a-4b0c-8a1a-6ff2997da3a6"
 void ble_setup();
 
+static unsigned long lastActivityTime = 0; // Timestamp of last user action
+static bool displaySleeping = false;
+
+inline void resetInactivityTimer()
+{
+  lastActivityTime = millis();
+}
+
 uint32_t lastReconnectAttempt = 0;
 void gsmLoop();
 void gsmSetup();
@@ -86,6 +98,26 @@ void measure();
 // Funkce pro obsluhu nenalezených stránek webového serveru
 
 // Deklarace funkcí
+// --- Low‑power helpers ----------------------------------------------------
+/// Put MPU6886 into SLEEP mode (write 0x40 to register 0x6B)
+/// and be sure the on‑board IR LED is driven LOW.
+static void sleepSensors()
+{
+  constexpr uint8_t MPU6886_ADDR = 0x68;
+  constexpr uint8_t REG_PWR_MGMT_1 = 0x6B;
+  Wire.beginTransmission(MPU6886_ADDR);
+  Wire.write(REG_PWR_MGMT_1);
+  Wire.write(0x40); // bit‑6 = SLEEP
+  Wire.endTransmission();
+
+  // IR LED on AtomS3/Lite is wired to GPIO2.
+  // Drive it LOW so it sinks no current.
+  constexpr gpio_num_t IR_PIN = GPIO_NUM_2;
+  pinMode(IR_PIN, OUTPUT);
+  digitalWrite(IR_PIN, LOW);
+
+  ESP_LOGI(TAG, "MPU6886 asleep, IR LED off");
+}
 void setupWiFiClient();
 void buttonLoop();
 void shortPressed();
@@ -111,7 +143,7 @@ static bool longButtonPressed = false;
 static bool updateStarted = false;
 static float rotationAngle = 0.0f; // Úhel rotace pro displej
 // HardwareSerial Serial1(2);         // UART2
-TinyGsm modem(Serial2);
+TinyGsm modem(Serial2, -1); // Added reset pin argument (-1 if not used) to match TinyGsmSim7028 constructor
 TinyGsmClient client(modem);
 PubSubClient mqtt(client);
 void publishMeasurements();
@@ -330,7 +362,7 @@ bool connectToBTServer()
       {
         pChrTable->subscribe(true, [](NimBLERemoteCharacteristic *pCharacteristic, uint8_t *pData, size_t length, bool isNotify)
                              {
-          ESP_LOGI(TAG, "Notify callback for characteristic %s, length=%d",
+          ESP_LOGV(TAG, "Notify callback for characteristic %s, length=%d",
                    pCharacteristic->getUUID().toString().c_str(), length);
 
           if (length >= 3) {
@@ -347,7 +379,7 @@ bool connectToBTServer()
               BLE_voltage = rawVolt / 1000.0f;
             }
 
-            ESP_LOGI(TAG,
+            ESP_LOGV(TAG,
                      "temp = %.2f °C ; humidity = %.1f %% ; voltage = %.3f V",
                      BLE_temperature, BLE_humidity, BLE_voltage);
           } else {
@@ -491,12 +523,20 @@ void setup()
   // Inicializace NVS pro ukládání nastavení displeje
   preferences.begin("display", false);
   rotationAngle = preferences.getFloat("rotation", 0.0f); // Načtení úhlu rotace
+  lastActivityTime = millis();
 
   // Inicializace M5Stack AtomS3 a displeje
   M5.begin();
   M5.Display.begin(); // Explicitní inicializace displeje pro jistotu
 
-  M5.Display.setBrightness(35); // Nastavení jasu displeje
+  // --- Deaktivace Wi‑Fi rozhraní, šetří paměť i energii ---
+  WiFi.mode(WIFI_OFF); // Vypne rádiovou část i DHCP úlohy
+  esp_wifi_stop();     // Zastaví Wi‑Fi driver
+  esp_wifi_deinit();   // Uvolní RAM alokovanou driverem
+  // --- Snížení taktu CPU kvůli úspoře energie ---
+  setCpuFrequencyMhz(80); // 80 MHz místo výchozích 240 MHz
+
+  M5.Display.setBrightness(20); // Nastavení jasu displeje
 
   Serial.begin(115200);                  // Inicializace sériové komunikace
   vTaskDelay(2000 / portTICK_PERIOD_MS); // Zpoždění pro připojení sériového monitoru
@@ -524,6 +564,7 @@ void setup()
   }
 
   Wire.begin();
+  sleepSensors();
 
   if (ina228_bat.begin(bat_addr) && ina228_solar.begin(solar_addr))
   {
@@ -604,6 +645,12 @@ void loop()
     measure();
     drawGUI();
     lastDrawTime = currentTime;
+
+    if (!displaySleeping && (millis() - lastActivityTime > 120000UL))
+    {
+      M5.Display.sleep(); // turns the panel off (M5Unified)
+      displaySleeping = true;
+    }
   }
 
   if (doConnect)
@@ -673,6 +720,14 @@ void buttonLoop()
       longButtonPressed = true;
       longPressed(); // Zavoláme funkci pro dlouhý stisk
     }
+
+    if (displaySleeping)
+    {
+      M5.Display.wakeup();
+      M5.Display.setBrightness(20); // your normal brightness
+      displaySleeping = false;
+    }
+    resetInactivityTimer();
   }
   else
   { // Tlačítko uvolněno
@@ -695,30 +750,32 @@ void shortPressed()
   ESP_LOGI(TAG, "Short button press");
 
   // Změna úhlu rotace displeje
-  rotationAngle = fmod(rotationAngle + 15, 360.0f);
-  preferences.putFloat("rotation", rotationAngle); // Uložení nového úhlu
 }
 
 // Funkce pro dlouhý stisk tlačítka
 void longPressed()
 {
   ESP_LOGI(TAG, "Long button press");
+  rotationAngle = fmod(rotationAngle + 15, 360.0f);
+  preferences.putFloat("rotation", rotationAngle); // Uložení nového úhlu
+  // if (updateStarted)
+  // {
+  //   ESP.restart(); // Restart zařízení, pokud je aktualizace spuštěna
+  //   return;
+  // }
+  // preferences.end(); // Uzavření NVS Preferences
 
-  if (updateStarted)
-  {
-    ESP.restart(); // Restart zařízení, pokud je aktualizace spuštěna
-    return;
-  }
-  preferences.end(); // Uzavření NVS Preferences
+  // setupWiFiClient(); // Spuštění WiFi klienta a OTA serveru
 
-  setupWiFiClient(); // Spuštění WiFi klienta a OTA serveru
-
-  updateStarted = true; // Nastavení příznaku, že aktualizace začala
+  // updateStarted = true; // Nastavení příznaku, že aktualizace začala
 }
 
 // Funkce pro kreslení grafického uživatelského rozhraní
 void drawGUI()
 {
+  if (displaySleeping)
+    return;
+
   canvas.fillSprite(BLACK); // Vyplnění canvasu černou barvou
   // Vykreslení kruhu pro ukazatel rychlosti
   int centerX = canvas.width() / 2;
@@ -844,7 +901,7 @@ void gsmSetup()
   ESP_LOGI(TAG, "Starting GSM modem Serial...");
   // Serial1.begin(9600, SERIAL_8N1, 39, 38); // Inicializace sériového portu pro modem
   Serial2.end();
-  Serial2.setPins(38, 39, -1); // Nastavení pinů pro RX, TX, RST (pokud není potřeba, použijte -1)
+  Serial2.setPins(39, 38, -1); // Nastavení pinů pro RX, TX, RST (pokud není potřeba, použijte -1)
   delay(100);
 
   // !!!!!!!!!!!
@@ -853,7 +910,7 @@ void gsmSetup()
   // Set GSM module baud rate
   TinyGsmAutoBaud(Serial2, GSM_AUTOBAUD_MIN, GSM_AUTOBAUD_MAX);
   // SerialAT.begin(9600);
-  vTaskDelay(6000 / portTICK_PERIOD_MS);
+  vTaskDelay(2000 / portTICK_PERIOD_MS);
 
   // Quick sanity check – does the modem answer "AT"?
   ESP_LOGI(TAG, "Testing basic AT command...");
